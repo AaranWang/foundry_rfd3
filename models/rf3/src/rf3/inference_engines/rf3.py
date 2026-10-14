@@ -21,7 +21,10 @@ from torch.utils.data import DataLoader
 
 from foundry.inference_engines.base import BaseInferenceEngine
 from foundry.metrics.metric import MetricManager
+from foundry.model.layers.attention import validate_attention_backend
 from foundry.utils.ddp import RankedLogger
+from rf3.model.layers.attention import TriangleAttention
+from rf3.model.layers.inference_kernels import enable_exact_kernels
 from rf3.model.RF3 import ShouldEarlyStopFn
 from rf3.utils.inference import (
     InferenceInput,
@@ -255,6 +258,8 @@ class RF3InferenceEngine(BaseInferenceEngine):
         # Output control
         compress_outputs: bool = False,
         early_stopping_plddt_threshold: float | None = None,
+        triangle_attention_backend: Literal["auto", "vanilla", "sdpa"] = "auto",
+        dense_attention_backend: Literal["auto", "vanilla", "sdpa"] = "auto",
         # Metrics
         metrics_cfg: dict | OmegaConf | MetricManager | str | None = "default",
         **kwargs,
@@ -274,6 +279,11 @@ class RF3InferenceEngine(BaseInferenceEngine):
               Defaults to ``False``.
           compress_outputs: Whether to gzip output files. Defaults to ``False``.
           early_stopping_plddt_threshold: Stop early if pLDDT below threshold. Defaults to ``None``.
+          triangle_attention_backend: ``auto`` uses native SDPA on MPS during
+              inference and preserves other backends. ``vanilla`` selects the
+              reference einsum path; ``sdpa`` explicitly selects native attention.
+          dense_attention_backend: Same backend choices for dense pairformer and
+              diffusion token attention; sparse atom attention is unaffected.
           metrics_cfg: Metrics configuration. Can be:
               - "default" to use standard RF3 metrics (ptm, iptm, clashing chains)
               - dict/OmegaConf with Hydra configs
@@ -287,6 +297,12 @@ class RF3InferenceEngine(BaseInferenceEngine):
               - devices_per_node (int): Number of devices per node. Defaults to ``1``.
               - verbose (bool): If True, show detailed logging and config trees. Defaults to ``False``.
         """
+        if triangle_attention_backend not in {"auto", "vanilla", "sdpa"}:
+            raise ValueError("triangle_attention_backend must be auto, vanilla or sdpa")
+        self.dense_attention_backend = validate_attention_backend(
+            dense_attention_backend
+        )
+        self.triangle_attention_backend = triangle_attention_backend
         # set MSA directories from environment variable only
         if env_var_msa_dirs := get_msa_dirs_from_env(raise_if_not_set=False):
             override_msa_dirs = [str(msa_dir) for msa_dir in env_var_msa_dirs]
@@ -353,6 +369,14 @@ class RF3InferenceEngine(BaseInferenceEngine):
             )
 
         cfg = super().initialize()
+
+        for module in self.trainer.state["model"].modules():
+            if isinstance(module, TriangleAttention):
+                module.attention_backend = self.triangle_attention_backend
+            if hasattr(module, "dense_attention_backend"):
+                module.dense_attention_backend = self.dense_attention_backend
+
+        enable_exact_kernels(self.trainer.state["model"])
 
         if cfg is not None:
             self.cfg = cfg  # store for later use
